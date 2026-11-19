@@ -5,17 +5,36 @@ import numpy as np
 CAMERA_NAME = "iphone"
 FALLBACK_INDEX = 0
 
-# ---- Workspace: measure the INSIDE of the black rectangle (mm) ----
-WORKSPACE_MM = (400, 300)       # (width, height)  <-- SET THIS
-USE_INNER_EDGE = True           # True = area inside the black border, False = outer edge of border
-EDGE_MARGIN = 8                 # px ignored along the cropped edges (border leftovers)
+# ---- Workspace: 4 ArUco markers (DICT_5X5_50, 15 mm, IDs 0-3), one in each desk corner ----
+# Desk top is 256 x 256 mm. WORKSPACE_MM = distance between the INNER corners of the
+# markers (the corner of each marker that points toward the middle of the desk).
+# Example: markers 3 mm from the desk edges -> inner corners at 3 + 15 = 18 mm
+#          -> 256 - 2*18 = 220 mm.  MEASURE IT on the real desk.
+WORKSPACE_MM = (220, 220)       # (width, height)  <-- SET THIS
+MARKER_IDS = (0, 1, 2, 3)       # any placement/rotation works, all 4 must be visible (ID 4 = spare)
+EDGE_MARGIN = 4                 # px ignored along the cropped edges
+
+# ---- Gantry: the charger can reach a 142 x 142 mm area under the desk ----
+GANTRY_TRAVEL_MM = (142, 142)
+# Where the gantry's (0, 0) sits in WORKSPACE coordinates (mm from the top-left inner
+# marker corner, as seen by the camera). Default assumes the travel area is centered.
+GANTRY_ORIGIN_MM = ((WORKSPACE_MM[0] - GANTRY_TRAVEL_MM[0]) / 2,
+                    (WORKSPACE_MM[1] - GANTRY_TRAVEL_MM[1]) / 2)
+GANTRY_FLIP_X = False           # set True if the gantry's +X points left in the camera view
+GANTRY_FLIP_Y = False           # set True if the gantry's +Y points up in the camera view
+
+ARUCO = cv2.aruco
+ARUCO_DICT = ARUCO.getPredefinedDictionary(ARUCO.DICT_5X5_50)
+_params = ARUCO.DetectorParameters()
+_params.cornerRefinementMethod = ARUCO.CORNER_REFINE_SUBPIX   # sharper corners
+DETECTOR = ARUCO.ArucoDetector(ARUCO_DICT, _params)
 
 WARP_W = 800
 WARP_H = int(WARP_W * WORKSPACE_MM[1] / WORKSPACE_MM[0])
 MM_PER_PX = WORKSPACE_MM[0] / WARP_W
 
 # ---- Change + shadow rejection ----
-DIFF_L = 25                     # brightness change needed (raise if noisy)
+DIFF_L = 25                     # brightness change needed (raise if noisy, ~15 for white-on-white)
 DIFF_CHROMA = 10                # color change needed
 SHADOW_MIN_RATIO = 0.45         # darker than this = real object, not shadow
 MIN_SOLIDITY = 0.80
@@ -34,6 +53,7 @@ def list_cameras():
         devs = AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo)
         return [str(d.localizedName()) for d in devs]
     except ImportError:
+        print("WARNING: pyobjc-framework-AVFoundation not installed, can't look up camera names")
         return []
 
 
@@ -43,7 +63,9 @@ def pick_camera():
         print(f"  [{i}] {n}")
     for i, n in enumerate(names):
         if CAMERA_NAME.lower() in n.lower():
+            print(f"Using [{i}] {n}")
             return i
+    print(f"WARNING: no '{CAMERA_NAME}' camera found, using index {FALLBACK_INDEX}")
     return FALLBACK_INDEX
 
 
@@ -56,27 +78,46 @@ def order_points(pts):
 
 
 def find_workspace(frame):
-    gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-    _, dark = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    contours, hier = cv2.findContours(dark, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    fh, fw = gray.shape
-    best, best_area = None, 0
-    if hier is not None:
-        for c, hr in zip(contours, hier[0]):
-            is_hole = hr[3] != -1
-            if is_hole != USE_INNER_EDGE:
-                continue
-            area = cv2.contourArea(c)
-            if not (0.05 * fw * fh < area < 0.95 * fw * fh) or area <= best_area:
-                continue
-            peri = cv2.arcLength(c, True)
-            for eps in (0.02, 0.03, 0.05):
-                approx = cv2.approxPolyDP(c, eps * peri, True)
-                if len(approx) == 4 and cv2.isContourConvex(approx):
-                    best, best_area = approx, area
-                    break
-    return (order_points(best) if best is not None else None), dark
+    """Returns (quad or None, marker_corners, marker_ids)."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = DETECTOR.detectMarkers(gray)
+    if ids is None:
+        return None, corners, ids
+
+    found = {}
+    for c, i in zip(corners, ids.ravel()):
+        if i in MARKER_IDS:
+            found[int(i)] = c.reshape(4, 2)
+    if len(found) < 4:
+        return None, corners, ids
+
+    # inner corner = the corner of each marker closest to the middle of all 4 markers,
+    # so it doesn't matter how each marker is rotated
+    center = np.mean([m.mean(axis=0) for m in found.values()], axis=0)
+    inner = [m[np.argmin(np.linalg.norm(m - center, axis=1))] for m in found.values()]
+    return order_points(np.array(inner)), corners, ids
+
+
+def ws_to_gantry(x_mm, y_mm):
+    """Workspace mm -> gantry mm. Returns (gx, gy, reachable); clamped to the travel area."""
+    gx = x_mm - GANTRY_ORIGIN_MM[0]
+    gy = y_mm - GANTRY_ORIGIN_MM[1]
+    if GANTRY_FLIP_X:
+        gx = GANTRY_TRAVEL_MM[0] - gx
+    if GANTRY_FLIP_Y:
+        gy = GANTRY_TRAVEL_MM[1] - gy
+    reachable = 0 <= gx <= GANTRY_TRAVEL_MM[0] and 0 <= gy <= GANTRY_TRAVEL_MM[1]
+    gx = min(max(gx, 0), GANTRY_TRAVEL_MM[0])
+    gy = min(max(gy, 0), GANTRY_TRAVEL_MM[1])
+    return gx, gy, reachable
+
+
+def draw_travel_area(img):
+    x0, y0 = (int(v / MM_PER_PX) for v in GANTRY_ORIGIN_MM)
+    x1 = int((GANTRY_ORIGIN_MM[0] + GANTRY_TRAVEL_MM[0]) / MM_PER_PX)
+    y1 = int((GANTRY_ORIGIN_MM[1] + GANTRY_TRAVEL_MM[1]) / MM_PER_PX)
+    cv2.rectangle(img, (x0, y0), (x1, y1), (255, 0, 255), 2)
+    cv2.putText(img, "charger reach", (x0 + 5, y0 + 25), FONT, 0.7, (255, 0, 255), 2)
 
 
 def to_lab(img):
@@ -92,6 +133,8 @@ def capture_background(cap, M, n=30):
         lab = to_lab(cv2.warpPerspective(frame, M, (WARP_W, WARP_H)))
         acc = lab if acc is None else acc + lab
         count += 1
+    if count == 0:
+        raise RuntimeError("No frames captured for background")
     return acc / count
 
 
@@ -110,12 +153,12 @@ def detect(warp, bg_lab):
     shadow = (dL < 0) & (ratio > SHADOW_MIN_RATIO) & (chroma < DIFF_CHROMA)
     shadow_d = cv2.dilate(shadow.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
 
-
     fg = (changed & ~shadow_d).astype(np.uint8) * 255
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
     m = EDGE_MARGIN
-    fg[:m, :] = 0; fg[-m:, :] = 0; fg[:, :m] = 0; fg[:, -m:] = 0
+    if m > 0:
+        fg[:m, :] = 0; fg[-m:, :] = 0; fg[:, :m] = 0; fg[:, -m:] = 0
 
     vis = np.zeros((WARP_H, WARP_W, 3), np.uint8)
     vis[shadow & changed] = (200, 120, 0)    # blue = shadow, ignored
@@ -133,7 +176,10 @@ def detect(warp, bg_lab):
             if hull == 0 or area_px / hull < MIN_SOLIDITY:
                 continue
             (cx, cy), size, angle = cv2.minAreaRect(c)
+            gx, gy, reach = ws_to_gantry(cx * MM_PER_PX, cy * MM_PER_PX)
             objs.append({
+                "gantry": (gx, gy),
+                "reachable": reach,
                 "label": "iPhone" if area_mm2 >= PHONE_MIN_MM2 else "AirPods",
                 "px": (int(cx), int(cy)),
                 "mm": (cx * MM_PER_PX, cy * MM_PER_PX),
@@ -183,8 +229,8 @@ def main():
                 print("Failed to capture frame.")
                 break
 
-            # 1-2. workspace detection
-            found, dark = find_workspace(frame)
+            # 1-2. workspace detection (4 ArUco markers)
+            found, m_corners, m_ids = find_workspace(frame)
             if not locked and found is not None:
                 if quad is None or np.abs(found - quad).max() > 40:
                     quad = found
@@ -193,23 +239,27 @@ def main():
                 M = cv2.getPerspectiveTransform(quad, dst)
 
             overlay = frame.copy()
-            sel = dark > 0
-            overlay[sel] = (0.5 * overlay[sel] + 0.5 * np.array([255, 0, 0])).astype(np.uint8)
+            if m_ids is not None:
+                ARUCO.drawDetectedMarkers(overlay, m_corners, m_ids)
+            n_seen = 0 if m_ids is None else len(set(m_ids.ravel()) & set(MARKER_IDS))
+            if not locked:
+                cv2.putText(overlay, f"markers: {n_seen}/4", (20, 60), FONT, 1.5,
+                            (0, 255, 0) if n_seen == 4 else (0, 0, 255), 3)
             if quad is not None:
                 color = (0, 255, 255) if locked else (0, 255, 0)
                 cv2.polylines(overlay, [quad.astype(int)], True, color, 4)
                 for i, p in enumerate(quad.astype(int)):
-                    cv2.putText(overlay, str(i + 1), tuple(p), FONT, 1.2, color, 3)
+                    cv2.putText(overlay, str(i + 1), (int(p[0]), int(p[1])), FONT, 1.2, color, 3)
 
             # 3-4. crop
             warp = cv2.warpPerspective(frame, M, (WARP_W, WARP_H)) if M is not None else None
 
-
-# 5-6. change + result
+            # 5-6. change + result
             change_t = blank("press 'b' (empty desk)")
             result_t = blank("no workspace found")
             if warp is not None:
                 result = warp.copy()
+                draw_travel_area(result)
                 if bg is not None:
                     vis, objs = detect(warp, bg)
                     change_t = vis
@@ -217,12 +267,15 @@ def main():
                         color = (0, 255, 0) if o["label"] == "iPhone" else (255, 128, 0)
                         cv2.drawContours(result, [o["box"]], 0, color, 3)
                         cv2.circle(result, o["px"], 8, (0, 0, 255), -1)
-                        cv2.putText(result, f'{o["label"]} ({o["mm"][0]:.0f}, {o["mm"][1]:.0f}) mm',
-                                    (o["px"][0] - 90, o["px"][1] - 20), FONT, 0.9, color, 2)
+                        tag = "" if o["reachable"] else " OUT"
+                        cv2.putText(result, f'{o["label"]} G({o["gantry"][0]:.0f}, {o["gantry"][1]:.0f}){tag}',
+                                    (max(o["px"][0] - 90, 5), max(o["px"][1] - 20, 25)), FONT, 0.8, color, 2)
                     if objs and time.time() - last_print > 0.25:
                         last_print = time.time()
                         for o in objs:
-                            print(f'{o["label"]}: x={o["mm"][0]:.1f} mm  y={o["mm"][1]:.1f} mm  '
+                            print(f'{o["label"]}: desk=({o["mm"][0]:.1f}, {o["mm"][1]:.1f}) mm  '
+                                  f'gantry=({o["gantry"][0]:.1f}, {o["gantry"][1]:.1f}) mm'
+                                  f'{"" if o["reachable"] else "  (out of reach, clamped)"}  '
                                   f'angle={o["angle"]:.0f}  area={o["area_mm2"]:.0f} mm2')
                 result_t = result
 
@@ -230,7 +283,7 @@ def main():
             warp_t = warp if warp is not None else blank("no workspace found")
 
             row1 = [tile(frame, "1. Camera feed"),
-                    tile(overlay, "2. Workspace " + ("(LOCKED)" if locked else "(live)")),
+                    tile(overlay, "2. Markers " + ("(LOCKED)" if locked else "(live)")),
                     tile(warp_t, "3. Cropped - color")]
             row2 = [tile(gray_t, "4. Cropped - grayscale"),
                     tile(change_t, "5. Change (white=obj, blue=shadow)"),
@@ -242,7 +295,7 @@ def main():
                 break
             if key == ord("b"):
                 if M is None:
-                    print("No workspace found yet.")
+                    print("Need all 4 markers visible first.")
                 else:
                     locked = True
                     bg = capture_background(cap, M)
@@ -259,5 +312,5 @@ def main():
             cv2.waitKey(1)
 
 
-if name == "__main__":
+if __name__ == "__main__":
     main()
